@@ -23,6 +23,10 @@ from app.models import (
     DeliveryTask, DiffRecord, ExtractRule, IncrCursor, ParseLogEntry,
     ProxyNode, QualitySample, RawExtractedContent, SampleMethod,
     SchedulePlan, SiteConfig, SiteType, StorageBatch, UrlFingerprint,
+    read_schedule_plan,
+)
+from app.scheduler_runtime import (
+    ExecutionManifest, PlanConfigSnapshot, claim_plan, run_plan,
 )
 from app.store import store
 
@@ -467,10 +471,10 @@ def compute_crawl_cost(job: CrawlJobSpec, proxy: ProxyNode | None) -> CostRecord
 
 def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
     """为采集作业创建调度计划。"""
-    # 找关联的调度计划
+    # 找关联的调度计划（关联作业列名兼容旧字典）
     for row in store.rows("scheduler"):
-        if str(row.get("关联作业")) == job.job_id:
-            plan = SchedulePlan.from_seed_row(row)
+        plan = read_schedule_plan(row)
+        if plan.linked_job_id and plan.linked_job_id == job.job_id:
             plan.next_run = datetime.now(timezone.utc).isoformat()
             plan.status = "执行中" if job.status in ("待执行", "采集执行") else "已完成"
             return plan
@@ -485,6 +489,16 @@ def schedule_job(job: CrawlJobSpec) -> SchedulePlan | None:
     )
     _persist_schedule(plan)
     return plan
+
+
+def trigger_schedule(identifier: str | int,
+                     snapshot: Any = None) -> ExecutionManifest:
+    """调度触发：以作业规格读取结果认领已登记计划，写入执行清单与运行记录。"""
+    if isinstance(identifier, PlanConfigSnapshot):
+        return claim_plan(identifier)
+    if snapshot is not None:
+        return claim_plan(snapshot)
+    return run_plan(identifier)
 
 
 # ---------------------------------------------------------------------------

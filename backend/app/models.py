@@ -75,6 +75,125 @@ class ArchiveFormat(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# 共用字段读取：采集任务与调度编排都从同一套旧字典读取作业规格
+# ---------------------------------------------------------------------------
+
+# 旧字典里的列名并不统一，兼容列在标准列之前按顺序尝试；标准列永远优先。
+JOB_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "job_id": ("作业编号", "任务编号", "job_id"),
+    "entry_urls": ("入口URL", "采集入口", "入口地址", "入口", "entry_urls", "entry_url"),
+    "max_depth": ("最大深度", "采集深度", "深度", "max_depth"),
+    "concurrency": ("并发线程", "并发数", "并发", "concurrency"),
+    "schedule_policy": ("调度策略", "调度方式", "schedule_policy"),
+    "completed_pages": ("完成页数", "已完成页数", "完成数", "completed_pages"),
+    "failed_pages": ("失败页数", "失败数", "failed_pages"),
+    "status": ("status", "作业状态", "任务状态"),
+}
+
+PLAN_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "plan_id": ("计划编号", "调度编号", "plan_id"),
+    "linked_job_id": ("关联作业", "关联任务", "作业编号", "linked_job_id"),
+    "cron_expr": ("Cron表达式", "Cron", "cron_expr"),
+    "timezone_setting": ("时区设置", "时区", "timezone_setting", "timezone"),
+    "dependency_check": ("依赖检查", "dependency_check"),
+    "failure_notify": ("失败通知", "failure_notify"),
+    "concurrency_control": ("并发控制", "concurrency_control"),
+    "next_run": ("下次执行", "next_run"),
+    "status": ("status", "计划状态"),
+    "config_version": ("配置版本", "配置快照", "快照版本", "config_version"),
+}
+
+DEFAULT_TIMEZONE = "Asia/Shanghai"
+
+
+def read_field(row: dict[str, Any], names: tuple[str, ...], default: Any = None) -> Any:
+    """按别名顺序读取字段：标准列优先，空值/空文本视为未提供。"""
+    for name in names:
+        if name not in row:
+            continue
+        value = row[name]
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return default
+
+
+def read_text(row: dict[str, Any], names: tuple[str, ...], default: str = "") -> str:
+    value = read_field(row, names, default)
+    return str(value) if value is not None else default
+
+
+def read_int(row: dict[str, Any], names: tuple[str, ...], default: int) -> int:
+    """数值字段按原规则转换：坏文本回退默认值，合法的 0 原样保留。"""
+    value = read_field(row, names, None)
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, float):
+        return int(value)
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+def read_url_list(row: dict[str, Any], names: tuple[str, ...]) -> list[str]:
+    """入口字段支持逗号分隔文本，也兼容已经拆好的列表。"""
+    value = read_field(row, names, None)
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        candidates = [str(item) for item in value]
+    else:
+        candidates = str(value).split(",")
+    return [item.strip() for item in candidates if item.strip()]
+
+
+def read_job_spec(source: dict[str, Any] | "CrawlJobSpec",
+                  site: SiteConfig | None = None) -> "CrawlJobSpec":
+    """作业规格的唯一读取入口：采集任务与调度编排共用，输入输出保持原口径。"""
+    if isinstance(source, CrawlJobSpec):
+        if site is not None:
+            source.site = site
+        return source
+
+    return CrawlJobSpec(
+        job_id=read_text(source, JOB_FIELD_ALIASES["job_id"]),
+        site=site or SiteConfig(site_id="", domain="", site_type=SiteType.NEWS,
+                                robots_policy="allow", language="zh-CN",
+                                region="CN", access_method="direct", registered_at=""),
+        entry_urls=read_url_list(source, JOB_FIELD_ALIASES["entry_urls"]),
+        max_depth=read_int(source, JOB_FIELD_ALIASES["max_depth"], 3),
+        concurrency=read_int(source, JOB_FIELD_ALIASES["concurrency"], 4),
+        schedule_policy=read_text(source, JOB_FIELD_ALIASES["schedule_policy"], "interval"),
+        completed_pages=read_int(source, JOB_FIELD_ALIASES["completed_pages"], 0),
+        failed_pages=read_int(source, JOB_FIELD_ALIASES["failed_pages"], 0),
+        status=read_text(source, JOB_FIELD_ALIASES["status"], "待执行"),
+    )
+
+
+def read_schedule_plan(source: dict[str, Any] | "SchedulePlan") -> "SchedulePlan":
+    """调度计划的唯一读取入口：旧字典缺字段时按原规则兜底。"""
+    if isinstance(source, SchedulePlan):
+        return source
+    return SchedulePlan(
+        plan_id=read_text(source, PLAN_FIELD_ALIASES["plan_id"]),
+        linked_job_id=read_text(source, PLAN_FIELD_ALIASES["linked_job_id"]),
+        cron_expr=read_text(source, PLAN_FIELD_ALIASES["cron_expr"]),
+        timezone_setting=read_text(
+            source, PLAN_FIELD_ALIASES["timezone_setting"], DEFAULT_TIMEZONE),
+        dependency_check=read_text(source, PLAN_FIELD_ALIASES["dependency_check"]),
+        failure_notify=read_text(source, PLAN_FIELD_ALIASES["failure_notify"]),
+        concurrency_control=read_text(source, PLAN_FIELD_ALIASES["concurrency_control"]),
+        next_run=read_text(source, PLAN_FIELD_ALIASES["next_run"]),
+        status=read_text(source, PLAN_FIELD_ALIASES["status"], "待激活"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # 跨模块数据类
 # ---------------------------------------------------------------------------
 
@@ -132,38 +251,8 @@ class CrawlJobSpec:
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any], site: SiteConfig | None = None) -> CrawlJobSpec:
-        raw_url = str(row.get("入口URL", ""))
-        # 支持逗号分隔的多 URL
-        urls = [u.strip() for u in raw_url.split(",") if u.strip()] if raw_url else []
-        try:
-            md = int(row.get("最大深度", 3))
-        except (ValueError, TypeError):
-            md = 3
-        try:
-            cc = int(row.get("并发线程", 4))
-        except (ValueError, TypeError):
-            cc = 4
-        try:
-            cp = int(row.get("完成页数", 0))
-        except (ValueError, TypeError):
-            cp = 0
-        try:
-            fp = int(row.get("失败页数", 0))
-        except (ValueError, TypeError):
-            fp = 0
-        return cls(
-            job_id=str(row.get("作业编号", "")),
-            site=site or SiteConfig(site_id="", domain="", site_type=SiteType.NEWS,
-                                     robots_policy="allow", language="zh-CN",
-                                     region="CN", access_method="direct", registered_at=""),
-            entry_urls=urls,
-            max_depth=md,
-            concurrency=cc,
-            schedule_policy=str(row.get("调度策略", "interval")),
-            completed_pages=cp,
-            failed_pages=fp,
-            status=str(row.get("status", "待执行")),
-        )
+        """保持原签名，内部委托给共享的 read_job_spec。"""
+        return read_job_spec(row, site)
 
 
 @dataclass
@@ -678,14 +767,5 @@ class SchedulePlan:
 
     @classmethod
     def from_seed_row(cls, row: dict[str, Any]) -> SchedulePlan:
-        return cls(
-            plan_id=str(row.get("计划编号", "")),
-            linked_job_id=str(row.get("关联作业", "")),
-            cron_expr=str(row.get("Cron表达式", "")),
-            timezone_setting=str(row.get("时区设置", "Asia/Shanghai")),
-            dependency_check=str(row.get("依赖检查", "")),
-            failure_notify=str(row.get("失败通知", "")),
-            concurrency_control=str(row.get("并发控制", "")),
-            next_run=str(row.get("下次执行", "")),
-            status=str(row.get("status", "待激活")),
-        )
+        """保持原签名，内部委托给共享的 read_schedule_plan。"""
+        return read_schedule_plan(row)
